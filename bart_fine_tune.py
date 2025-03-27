@@ -13,14 +13,21 @@ from sklearn.model_selection import train_test_split, KFold
 from utilities import initialize_key_value_summary
 from transformers import BartForConditionalGeneration, BartTokenizer, Trainer, TrainingArguments, DataCollatorForSeq2Seq, EarlyStoppingCallback
 
-from utilities import extract_text_from_pdf, extract_text_from_word, create_chunks_from_paragraphs
-
-def clean_summary(summary):
-    """Cleans a single summary string by removing unnecessary newlines and ensuring consistent formatting."""
-    return summary.replace("\n", "\\").strip()
+from utilities import extract_text_from_pdf, extract_text_from_word, create_chunks_from_paragraphs, clean_text
 
 def load_text(file_path):
-    """Reads the text from a file and returns it as a string."""
+    """
+    Reads and cleans text from a file (PDF, DOCX, or TXT format).
+
+    Args:
+        file_path (str): Path to the input file
+
+    Returns:
+        str: The cleaned text content of the file
+
+    Raises:
+        ValueError: If the file format is unsupported
+    """
     if file_path.endswith(".pdf"):
         return clean_text(extract_text_from_pdf(file_path))
     elif file_path.endswith(".docx"):
@@ -31,18 +38,16 @@ def load_text(file_path):
     else:
         raise ValueError("Unsupported file format. Supported formats: .txt, .pdf, .docx")
 
-def clean_text(text):
-    """Cleans the text by replacing specific characters with their desired replacements."""
-    replacements = {
-        "’": "'",
-        "–": "-"
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
-
 def save_notes_and_summaries_to_csv(notes_folder, summaries_folder, output_csv, max_chunk_size=3500):
-    """Save clinical notes and summaries to a CSV file."""
+    """
+    Processes clinical notes and summaries into chunked pairs saved as CSV.
+
+    Args:
+        notes_folder (str): Directory containing clinical notes
+        summaries_folder (str): Directory containing corresponding summaries
+        output_csv (str): Path to save the output CSV file
+        max_chunk_size (int, optional): Maximum size for text chunks. Defaults to 3500.
+    """
     texts, summaries = [], []  # Corrected initialization
     
     for note_filename in os.listdir(notes_folder):
@@ -74,11 +79,27 @@ def save_notes_and_summaries_to_csv(notes_folder, summaries_folder, output_csv, 
     print(f"Data saved to {output_csv}")
 
 def split_summary_text(summary_text):
-    """Splits the summary text by a long '-' delimiter, indicating different chunk summaries."""
+    """
+    Splits a summary into chunks based on a long delimiter pattern.
+
+    Args:
+        summary_text (str): The full summary text to split
+
+    Returns:
+        list: List of individual summary chunks
+    """
     return [chunk.strip() for chunk in summary_text.split("-"*100) if chunk.strip()]
 
 def assign_patient_ids(data):
-    """Fills missing patient_id values based on the last seen patient_id."""
+    """
+    Propagates patient IDs through a DataFrame based on extracted identifiers.
+
+    Args:
+        data (pd.DataFrame): DataFrame containing clinical text data
+
+    Returns:
+        pd.DataFrame: DataFrame with added patient_id column
+    """
     current_patient_id = None
     patient_ids = []
     
@@ -94,7 +115,14 @@ def assign_patient_ids(data):
     return data
 
 def prepare_folds(input_csv, output_dir, n_splits=5):
-    """Prepares multiple train-validation-test splits for cross-validation while keeping the 80%-10%-10% ratio."""
+    """
+    Creates k-fold train/validation/test splits while preserving patient groupings.
+
+    Args:
+        input_csv (str): Path to source CSV data
+        output_dir (str): Directory to save fold datasets
+        n_splits (int, optional): Number of folds to create. Defaults to 5.
+    """
     
     data = pd.read_csv(input_csv)
     data = assign_patient_ids(data)  # Ensure patient IDs are assigned correctly
@@ -137,7 +165,14 @@ def prepare_folds(input_csv, output_dir, n_splits=5):
     print(f"Cross-validation folds prepared and saved in {output_dir}")
 
 def fine_tune(training_path, validation_path, output_dir):
-    """Fine-tunes the BART model on the given training and validation datasets."""
+    """
+    Fine-tunes a BART model for summarization on provided datasets.
+
+    Args:
+        training_path (str): Path to training CSV
+        validation_path (str): Path to validation CSV
+        output_dir (str): Directory to save trained model
+    """
     dataset = load_dataset("csv", data_files={"train": training_path, "validation": validation_path})
 
     model_name = "facebook/bart-large-cnn"
@@ -147,6 +182,20 @@ def fine_tune(training_path, validation_path, output_dir):
     keys = list(initialize_key_value_summary().keys())
 
     def preprocess_function(examples):
+        """
+        Preprocesses text-summary pairs into tokenized inputs for the BART model.
+    
+        Args:
+            examples (dict): A batch containing:
+                - "text" (list[str]): List of input texts
+                - "summary" (list[str]): List of target summaries
+    
+        Returns:
+            dict: Processed batch containing:
+                - "input_ids": Tokenized input texts
+                - "attention_mask": Attention masks for inputs
+                - "labels": Tokenized target summaries
+        """
         input_texts = [f'Using this list: {keys}, summarize this note: {text}' for text in examples["text"]]
         model_inputs = tokenizer(examples["text"], max_length=1024, truncation=True, padding="max_length")
         labels = tokenizer(examples["summary"], max_length=150, truncation=True, padding="max_length").input_ids
@@ -174,6 +223,17 @@ def fine_tune(training_path, validation_path, output_dir):
     )
 
     def compute_metrics(eval_preds):
+        """
+        Computes ROUGE scores between generated and reference summaries.
+    
+        Args:
+            eval_preds (tuple): Contains:
+                - logits (np.ndarray): Model prediction logits
+                - labels (np.ndarray): Ground truth label IDs
+    
+        Returns:
+            dict: ROUGE scores (ROUGE-1, ROUGE-2, ROUGE-L, ROUGE-Lsum) scaled to 0-100
+        """
         metric = evaluate.load("rouge")
         logits, labels = eval_preds
         
@@ -213,7 +273,17 @@ def fine_tune(training_path, validation_path, output_dir):
     print(f"Model saved to {output_dir}")
 
 def cross_validate(csv_folder, output_dir, n_splits=5):
-    """Performs 5-fold cross-validation on the dataset."""
+    """
+    Performs k-fold cross-validation for model evaluation.
+
+    Args:
+        csv_folder (str): Directory containing pre-split fold data
+        output_dir (str): Directory to save model outputs
+        n_splits (int, optional): Number of folds. Defaults to 5.
+
+    Returns:
+        dict: Aggregated evaluation metrics across all folds
+    """
     fold_results = []
     
     for fold in range(n_splits):
@@ -244,13 +314,36 @@ def cross_validate(csv_folder, output_dir, n_splits=5):
     print("Aggregated results:", aggregated_results)
 
 def evaluate_model(model_dir, test_csv):
-    """Evaluates the model on the test set."""
+    """
+    Evaluates a trained model on test data.
+
+    Args:
+        model_dir (str): Directory containing saved model
+        test_csv (str): Path to test CSV data
+
+    Returns:
+        dict: Evaluation metrics
+    """
     model = BartForConditionalGeneration.from_pretrained(model_dir)
     tokenizer = BartTokenizer.from_pretrained(model_dir)
     
     test_dataset = load_dataset("csv", data_files={"test": test_csv})
     
     def preprocess_function(examples):
+        """
+        Tokenizes text-summary pairs without additional prompt formatting.
+    
+        Args:
+            examples (dict): A batch containing:
+                - "text" (list[str]): Input texts
+                - "summary" (list[str]): Target summaries
+    
+        Returns:
+            dict: Tokenized inputs with:
+                - "input_ids": Tokenized text
+                - "attention_mask": Input masks
+                - "labels": Tokenized summaries
+        """
         model_inputs = tokenizer(examples["text"], max_length=1024, truncation=True, padding="max_length")
         labels = tokenizer(examples["summary"], max_length=150, truncation=True, padding="max_length").input_ids
         model_inputs["labels"] = labels
@@ -269,7 +362,15 @@ def evaluate_model(model_dir, test_csv):
     return results
 
 def aggregate_results(fold_results):
-    """Aggregates results across folds."""
+    """
+    Computes mean metrics across cross-validation folds.
+
+    Args:
+        fold_results (list): List of evaluation metrics per fold
+
+    Returns:
+        dict: Averaged metrics across all folds
+    """
     aggregated_results = {}
     for key in fold_results[0].keys():
         aggregated_results[key] = np.mean([result[key] for result in fold_results])
