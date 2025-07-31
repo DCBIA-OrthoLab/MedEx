@@ -1,21 +1,22 @@
 import os
-import re
+import gc
 import csv
+import time
 import json
-import fitz
 import torch
 import argparse
 import evaluate
 import numpy as np
 import pandas as pd
-from docx import Document
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 from utilities import initialize_key_value_summary
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForSeq2Seq, EarlyStoppingCallback, BitsAndBytesConfig
-
 from utilities import extract_text_from_pdf, extract_text_from_word, create_chunks_from_paragraphs
+
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,backend:cudaMallocAsync"
+
 
 def clean_summary(summary):
     """Cleans a single summary string by removing unnecessary newlines and ensuring consistent formatting.
@@ -68,31 +69,31 @@ def clean_text(text):
         text = text.replace(old, new)
     return text
 
-def save_notes_and_summaries_to_csv(notes_folder, summaries_folder, output_csv, max_chunk_size=12000):
+def save_notes_and_summaries_to_csv(notes_folder, summaries_folder, output_csv, max_chunk_size=120000):
     """Save clinical notes and summaries to a CSV file.
 
     Args:
         notes_folder (str): Path to the folder containing clinical notes.
         summaries_folder (str): Path to the folder containing the summaries.
         output_csv (str): Path to save the output CSV file.
-        max_chunk_size (int, optional): Maximum number of characters used for each chunk. Defaults to 12000.
+        max_chunk_size (int, optional): Maximum number of characters used for each chunk. Defaults to 120000.
     """
     texts, summaries = [], []
-    
     for note_filename in os.listdir(notes_folder):
         if note_filename.endswith((".txt", ".pdf", ".docx")):
             patient_id = note_filename.split("_")[0]
             summary_filename = f"{patient_id}_summary.txt"
-            note_path, summary_path = os.path.join(notes_folder, note_filename), os.path.join(summaries_folder, summary_filename)
-            
+            note_path = os.path.join(notes_folder, note_filename)
+            summary_path = os.path.join(summaries_folder, summary_filename)
             if os.path.exists(note_path) and os.path.exists(summary_path):
-                dict = initialize_key_value_summary()
-                keys = list(dict.keys())
+                keys = list(initialize_key_value_summary().keys())
                 
                 text = load_text(note_path)
                 summary = load_text(summary_path)
                 
                 chunks = create_chunks_from_paragraphs(text, max_chunk_size=max_chunk_size)
+                if len(chunks) != 1:
+                    print(f"Info: Split {patient_id} into {len(chunks)} chunks.")
                 summary_chunks = split_summary_text(summary)
                 
                 if len(chunks) != len(summary_chunks):
@@ -132,7 +133,6 @@ def assign_patient_ids(data):
     for index, row in data.iterrows():
         # Extract patient_id from the 'summary' column using regex
         extracted_id = pd.Series(row['summary']).str.extract(r'patient_id: (\w+)')[0].values[0]
-        
         if pd.notna(extracted_id):
             current_patient_id = extracted_id
         
@@ -141,7 +141,7 @@ def assign_patient_ids(data):
     data["patient_id"] = patient_ids
     return data
 
-def split_data_by_patient(input_csv, output_dir):
+def prepare_folds(input_csv, output_dir, n_splits=5):
     """Splits the data into training, validation, and test sets based on unique patient IDs.
 
     Args:
@@ -154,25 +154,25 @@ def split_data_by_patient(input_csv, output_dir):
     data = pd.read_csv(input_csv)
     data = assign_patient_ids(data)
     data = data.dropna(subset=["patient_id"])
-    unique_patients = data["patient_id"].unique()
-
-    train_patients, temp_patients = train_test_split(unique_patients, train_size=0.8, random_state=42)
-    val_patients, test_patients = train_test_split(temp_patients, test_size=0.5, random_state=42)
-
-    train_data = data[data["patient_id"].isin(train_patients)]
-    val_data = data[data["patient_id"].isin(val_patients)]
-    test_data = data[data["patient_id"].isin(test_patients)]
-    
-    train_data = train_data.drop(columns=["patient_id"])
-    val_data = val_data.drop(columns=["patient_id"])
-    test_data = test_data.drop(columns=["patient_id"])
-
-    train_data.to_csv(os.path.join(output_dir, "train.csv"), index=False, quoting=csv.QUOTE_ALL)
-    val_data.to_csv(os.path.join(output_dir, "validation.csv"), index=False, quoting=csv.QUOTE_ALL)
-    test_data.to_csv(os.path.join(output_dir, "test.csv"), index=False, quoting=csv.QUOTE_ALL)
-
-    print("Data split by patient and saved.")
-    return train_data, val_data, test_data
+    unique_patients = np.array(data["patient_id"].unique())
+    for fold in range(n_splits):
+        print(f"Preparing fold {fold + 1}/{n_splits}")
+        np.random.seed(fold)
+        np.random.shuffle(unique_patients)
+        train_patients, temp_patients = train_test_split(unique_patients, train_size=0.80, random_state=fold)
+        val_patients, test_patients = train_test_split(temp_patients, train_size=0.50, random_state=fold)
+        train_data = data[data["patient_id"].isin(train_patients)]
+        val_data = data[data["patient_id"].isin(val_patients)]
+        test_data = data[data["patient_id"].isin(test_patients)]
+        train_data = train_data.drop(columns=["patient_id"])
+        val_data = val_data.drop(columns=["patient_id"])
+        test_data = test_data.drop(columns=["patient_id"])
+        fold_dir = os.path.join(output_dir, f"fold_{fold + 1}")
+        os.makedirs(fold_dir, exist_ok=True)
+        train_data.to_csv(os.path.join(fold_dir, "train.csv"), index=False, quoting=csv.QUOTE_ALL)
+        val_data.to_csv(os.path.join(fold_dir, "validation.csv"), index=False, quoting=csv.QUOTE_ALL)
+        test_data.to_csv(os.path.join(fold_dir, "test.csv"), index=False, quoting=csv.QUOTE_ALL)
+        print(f"Fold {fold + 1} created: Train={len(train_data)}, Validation={len(val_data)}, Test={len(test_data)}")
 
 def fine_tune(training_path, validation_path, output_dir):
     dataset = load_dataset("csv", data_files={"train": training_path, "validation": validation_path})
@@ -190,6 +190,7 @@ def fine_tune(training_path, validation_path, output_dir):
         model_name,
         quantization_config=quantization_config,
         device_map="auto",
+        torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
 
@@ -198,24 +199,40 @@ def fine_tune(training_path, validation_path, output_dir):
     model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
-        r=16,  # Rank of LoRA layers
-        lora_alpha=32,  # Scaling factor
-        target_modules=["q_proj", "v_proj"],  # Apply LoRA to attention layers
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,  # Task type: causal language modeling
+        r=64,  # High rank to capture structural patterns (key-value pairs, sections)
+        lora_alpha=128,  # Large scaling factor to emphasize learned structure
+        target_modules=[
+            # Attention layers (structure mapping)
+            "q_proj", "k_proj", "v_proj", "o_proj",  
+            
+            # MLP layers (content selection)
+            "gate_proj", "up_proj", "down_proj"
+        ],
+        lora_dropout=0.05,  # Lower dropout to preserve structural tokens
+        bias="lora_only",   # Avoid destabilizing pretrained biases
+        task_type=TaskType.CAUSAL_LM,
     )
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()  # Check trainable parameters
 
     def preprocess_function(examples):
-        inputs = [f"Summarize: {text}" for text in examples["text"]]
-        model_inputs = tokenizer(inputs, max_length=3000, truncation=True, padding="max_length")
+        # Build the full supervised prompt (text + summary)
+        inputs = [
+            f"Summarize: {text}\nSummary: {summary}"
+            for text, summary in zip(examples["text"], examples["summary"])
+        ]
 
-        labels = tokenizer(text_target=examples["summary"], max_length=100, truncation=True, padding="max_length").input_ids
+        # Tokenize full concatenated text
+        model_inputs = tokenizer(
+            inputs,
+            max_length=1324,
+            truncation=True,
+            padding="longest",
+        )
 
-        model_inputs["labels"] = labels
+        model_inputs["labels"] = model_inputs["input_ids"].copy()
+
         return model_inputs
 
     tokenized_datasets = dataset.map(preprocess_function, batched=True)
@@ -224,24 +241,26 @@ def fine_tune(training_path, validation_path, output_dir):
 
     training_args = TrainingArguments(
         output_dir=output_dir,
-        evaluation_strategy="epoch",
-        save_strategy="steps",
-        save_steps=500,
-        save_total_limit=3,
-        learning_rate=1e-5,
+        label_names=["labels"],
+        eval_strategy="no",
+        save_strategy="epoch",
+        # eval_steps=500,
+        # save_steps=500,
+        learning_rate=5e-6,
         lr_scheduler_type="cosine",
         warmup_steps=100,
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         weight_decay=0.01,
-        num_train_epochs=3,
+        save_total_limit=None,
+        num_train_epochs=4,
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_rouge1",
-        greater_is_better=True,
-        fp16=True,
-        bf16=False,
+        # load_best_model_at_end=True,
+        # metric_for_best_model="eval_rouge1",
+        # greater_is_better=True,
+        fp16=False,
+        bf16=True,
     )
 
     def compute_metrics(eval_preds):
@@ -251,15 +270,32 @@ def fine_tune(training_path, validation_path, output_dir):
         if isinstance(logits, tuple):
             logits = logits[0]
 
-        predictions = np.argmax(logits, axis=-1)
-        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        # Process in batches to avoid OOM
+        batch_size = 16
+        decoded_preds = []
+        decoded_labels = []
+        
+        for i in range(0, len(logits), batch_size):
+            batch_logits = logits[i:i+batch_size]
+            batch_labels = labels[i:i+batch_size]
+            
+            predictions = np.argmax(batch_logits, axis=-1)
+            decoded_preds.extend(tokenizer.batch_decode(predictions, skip_special_tokens=True))
 
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-        result = {key: value * 100 for key, value in result.items()}
-        return result
+            batch_labels = np.where(batch_labels != -100, batch_labels, tokenizer.pad_token_id)
+            decoded_labels.extend(tokenizer.batch_decode(batch_labels, skip_special_tokens=True))
+        
+        # Compute ROUGE in chunks
+        result = {}
+        for i in range(0, len(decoded_preds), batch_size):
+            chunk_preds = decoded_preds[i:i+batch_size]
+            chunk_labels = decoded_labels[i:i+batch_size]
+            chunk_result = metric.compute(predictions=chunk_preds, references=chunk_labels, use_stemmer=True)
+            for k, v in chunk_result.items():
+                result[k] = result.get(k, 0) + v * 100
+        
+        # Average results
+        return {k: v / (len(decoded_preds) * batch_size) for k, v in result.items()}
 
     early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=2)
 
@@ -268,39 +304,72 @@ def fine_tune(training_path, validation_path, output_dir):
         args=training_args,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
-        tokenizer=tokenizer,
+        preprocess_logits_for_metrics=None,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        callbacks=[early_stopping_callback],
+        # compute_metrics=compute_metrics,
+        # callbacks=[early_stopping_callback],
     )
 
-    trainer.train(resume_from_checkpoint=True)
-    results = trainer.evaluate()
-    print(results)
+    trainer.train()
+    # trainer.train(resume_from_checkpoint=True)
+    torch.cuda.empty_cache()
+    gc.collect()
+    # results = trainer.evaluate()
+    # print(results)
+
+    # del trainer
+    # torch.cuda.empty_cache()
+    # gc.collect()
 
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"Model saved to {output_dir}")
+
+def cross_validate(csv_folder, output_dir, n_splits=5):
+    """Performs 5-fold cross-validation on the dataset."""
     
-    with open(os.path.join(output_dir, "final_eval_results.json"), "w") as f:
-        json.dump(results, f, indent=4)
+    for fold in range(n_splits):
+        print(f"Processing fold {fold + 1}/{n_splits}")
+        
+        # Define paths for training and validation CSV files for this fold
+        train_csv = os.path.join(csv_folder, f"fold_{fold + 1}", "train.csv")
+        val_csv = os.path.join(csv_folder, f"fold_{fold + 1}", "validation.csv")
+        
+        
+        model_dir = os.path.join(output_dir, f"fold_{fold + 1}", "model")
+        os.makedirs(model_dir, exist_ok=True)
+        
+        fine_tune(
+            training_path=train_csv,
+            validation_path=val_csv,
+            output_dir=model_dir
+        )
+        
+        # --- CRITICAL: CLEAR MEMORY BETWEEN FOLDS ---
+        torch.cuda.empty_cache()
+        gc.collect()
+        time.sleep(5)  # Allow GPU to fully clear
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data or fine-tune model for summarization.")
-    parser.add_argument("--prepare_data", action="store_true", help="If set, prepares the data by saving clinical notes to CSV.")
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory with clinical notes with prompts in .txt format.")
-    parser.add_argument("--summaries_dir", type=str, required=True, help="Directory with summaries in .txt format.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the output model or CSV.")
-    parser.add_argument("--train_csv", type=str, help="Path to the training CSV for fine-tuning.")
-    parser.add_argument("--val_csv", type=str, help="Path to the validation CSV for fine-tuning.")
-    
+    parser.add_argument("--prepare_data", action="store_true", help="Prepare the CSVs from input folders.")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory with clinical notes.")
+    parser.add_argument("--summaries_dir", type=str, required=True, help="Directory with summaries.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save outputs.")
+    parser.add_argument("--train_csv", type=str, help="Path to training CSV.")
+    parser.add_argument("--val_csv", type=str, help="Path to validation CSV.")
+    parser.add_argument("--CSV_folder", type=str, help="Path to folds directory.")
+    parser.add_argument("--cross_validate", action="store_true", help="Run 5-fold cross-validation.")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    
     if args.prepare_data:
         output_csv = os.path.join(args.output_dir, "clinical_data.csv")
-        data = save_notes_and_summaries_to_csv(args.input_dir, args.summaries_dir, output_csv)
-        split_data_by_patient(output_csv, args.output_dir)
+        save_notes_and_summaries_to_csv(args.input_dir, args.summaries_dir, output_csv)
+        prepare_folds(output_csv, args.output_dir)
+    elif args.cross_validate:
+        if not args.CSV_folder:
+            raise ValueError("Please specify --CSV_folder for cross-validation.")
+        cross_validate(args.CSV_folder, args.output_dir)
     else:
         if args.train_csv and args.val_csv:
             fine_tune(args.train_csv, args.val_csv, args.output_dir)

@@ -2,25 +2,184 @@ import argparse
 import os
 import re
 import json
+import fitz
 import torch
 import string
+from docx import Document
 from transformers import BartTokenizer, BartForConditionalGeneration, GenerationConfig
-from utilities import initialize_key_value_summary, create_chunks_from_paragraphs, extract_text_from_pdf, extract_text_from_word, load_model_and_tokenizer
+from utilities import initialize_key_value_summary, create_chunks_from_paragraphs
 
-def generate_combined_summary(model, tokenizer, text, max_chunk_size=3500, model_max_tokens=1024):
+def load_model_and_tokenizer():
+    model_name_or_path = "/home/lucia/Documents/Alban/MedEx/finetuned_models/fintetuned_bart_3500_prompt"
+    tokenizer = BartTokenizer.from_pretrained(model_name_or_path)
+    model = BartForConditionalGeneration.from_pretrained(model_name_or_path)
+    return model, tokenizer
+
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return clean_text(text)
+
+def extract_text_from_word(docx_path):
+    doc = Document(docx_path)
+    return "\n".join([clean_text(paragraph.text) for paragraph in doc.paragraphs])
+
+def clean_text(text):
     """
-    Generates a combined summary by processing text in chunks using a BART model.
+    Cleans the text by replacing specific characters with their desired replacements.
+    
+    Args:
+        text (str): The input text to clean.
+    
+    Returns:
+        str: The cleaned text.
+    """
+    replacements = {
+        "’": "'",
+        "–": "-"
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+def load_criteria(file_path):
+    criteria = []
+    context_filters = {}
+
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line:  # skip empty lines
+            continue
+        
+        if ":" in line:  # if line has a colon, it's a word with context filters
+            word, context = line.split(":", 1)
+            word = word.strip()
+            context_terms = [term.strip().strip('"') for term in context.split(",")]
+            context_filters[word] = context_terms
+            criteria.append(word)
+        else:
+            # If no colon, just add the word to the criteria list
+            word = line.strip()
+            criteria.append(word)
+
+    return criteria, context_filters
+
+def find_matching_criteria_with_window(text, criteria, context_filters, window_size=3):
+    """
+    Find matches for criteria in the text, considering context filters and wildcards.
 
     Args:
-        model (BartForConditionalGeneration): Pre-trained BART model for summarization
-        tokenizer (BartTokenizer): Tokenizer for the BART model
-        text (str): Input text to be summarized
-        max_chunk_size (int, optional): Maximum character length for each chunk. Defaults to 3500.
-        model_max_tokens (int, optional): Maximum token length for model input. Defaults to 1024.
+        text (str): The input text to search.
+        criteria (list): List of primary words to match.
+        context_filters (dict): Dictionary of primary words and their associated context filters.
+        window_size (int): The size of the window for context filtering.
 
     Returns:
-        str: Combined summary of all chunks separated by dividers
+        list: List of matches, including primary words and word-context combinations.
     """
+    matches = []
+
+    for criterion in criteria:
+        # If the criterion has a wildcard, build a regex for it
+        if "*" in criterion:
+            regex = r'\b' + re.escape(criterion).replace(r'\*', r'\w*') + r'\b'
+        else:
+            regex = r'\b' + re.escape(criterion) + r'\b'
+
+        # Find matches for the primary word
+        for match in re.finditer(regex, text, flags=re.IGNORECASE):
+            word = match.group(0).lower().strip(string.punctuation)  # Remove trailing punctuation
+
+            # If there are no context filters, add the word to matches
+            if (criterion not in context_filters) and (word not in matches):
+                matches.append(word)
+            elif criterion in context_filters:
+                # Handle context filters with wildcards
+                context_terms = context_filters[criterion]
+                context_regexes = [
+                    (r'\b' + re.escape(term).replace(r'\*', r'\w*') + r'\b') if "*" in term
+                    else (r'\b' + re.escape(term) + r'\b')
+                    for term in context_terms
+                ]
+
+                # Get the surrounding words for the context window
+                start_idx = match.start()
+                words_before = text[:start_idx].split()[-window_size+1:]
+                words_after = text[start_idx + len(match.group(0)):].split()[:window_size]
+                context_window = words_before + [word] + words_after
+
+                # Look for context terms in the context window
+                for context_regex in context_regexes:
+                    for w in context_window:
+                        w_cleaned = w.strip(string.punctuation)  # Remove trailing punctuation from context word
+                        if re.search(context_regex, w_cleaned, flags=re.IGNORECASE):
+                            combination = f"{word} {w_cleaned}"  # Use the cleaned words from the text
+                            if combination not in matches:
+                                matches.append(combination)
+    return matches
+
+def format_prompt(matches):
+    """
+    Create a prompt based on the found criteria matches.
+    """
+    if not matches:
+        return "No relevant criteria found in the text."
+    
+    # Format the prompt with the matched terms
+    prompt = "Summarize this text focusing only on details related to: " + ", ".join(matches) + "."
+    return prompt
+
+def split_text_by_paragraphs(text):
+    """
+    Splits text into paragraphs based on likely paragraph boundaries.
+    - Ensures list items stay together within the same paragraph.
+    - Separates sections based on common section header keywords (e.g., "RADIOGRAPHIC EVALUATION").
+    """
+    # Normalize line breaks
+    normalized_text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # Define common section headers that should act as paragraph boundaries
+    section_headers = ["CLINICAL EXAMINATION", "RADIOGRAPHIC EVALUATION", "WATERS VIEW", "IMPRESSION"]
+    header_pattern = r'(' + '|'.join(section_headers) + r')\.?'
+
+    # Split based on double newlines, numbered lists, or section headers
+    paragraphs = re.split(r'\n\s*\n|\n(?=\d+\.\s)|\n(?=\-)|\n(?=\*)|' + header_pattern, normalized_text)
+
+    merged_paragraphs = []
+    current_paragraph = ""
+
+    for para in paragraphs:
+        if para is None:
+            continue
+
+        para = para.strip()  # Remove leading and trailing whitespace
+
+        if para in section_headers:
+            # Treat section header as a separate paragraph
+            if current_paragraph:
+                merged_paragraphs.append(current_paragraph.strip())
+            current_paragraph = para  # Start new paragraph with the section header
+        elif re.match(r'^\d+\.\s|^[\-*]\s', para) or (current_paragraph and len(current_paragraph) < 150):
+            # Add list items to the current paragraph
+            current_paragraph += "\n" + para
+        else:
+            # Append current paragraph if it's not empty and reset for the new paragraph
+            if current_paragraph:
+                merged_paragraphs.append(current_paragraph.strip())
+            current_paragraph = para  # Start a new paragraph
+
+    # Add any remaining text as the last paragraph
+    if current_paragraph:
+        merged_paragraphs.append(current_paragraph.strip())
+
+    return merged_paragraphs
+
+def generate_combined_summary(model, tokenizer, text, max_chunk_size=3500, model_max_tokens=1024):
     chunks = create_chunks_from_paragraphs(text, max_chunk_size=max_chunk_size)
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,19 +191,19 @@ def generate_combined_summary(model, tokenizer, text, max_chunk_size=3500, model
     
     generation_config = GenerationConfig(
         max_length=model_max_tokens,
-        min_length=3,
+        min_length=50,
+        num_beams=4,
+        no_repeat_ngram_size=3,
+        repetition_penalty=2.0,
         length_penalty=1.0,
-        num_beams=8,
         do_sample=True,
-        temperature=0.9,
-        top_k=40,
-        top_p=0.9,
+        temperature=0.6,
+        top_p=0.95,
     )
     
     for chunk in chunks:
-        prompt = f'Using this list: {keys}, summarize this note: {chunk}'
-        inputs = tokenizer(chunk, return_tensors="pt").to(device)
-        # , truncation=True, max_length=model_max_tokens
+        prompt = f"Using the following note, extract structured key-value pairs about the patient's symptoms and diagnoses:\n\n{chunk}"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=model_max_tokens).to(device)
         
         if inputs["input_ids"].shape[1] > model_max_tokens:
             print(f"WARNING: Chunk exceeded {model_max_tokens} tokens, truncating.")
@@ -62,19 +221,10 @@ def generate_combined_summary(model, tokenizer, text, max_chunk_size=3500, model
     return final_summary
 
 def process_notes(notes_folder, output_folder, model, tokenizer):
-    """
-    Processes clinical notes for each patient and generates summaries.
-
-    Args:
-        notes_folder (str): Path to folder containing patient notes (PDF/DOCX)
-        output_folder (str): Path to save generated summaries
-        model (BartForConditionalGeneration): Pre-trained BART model
-        tokenizer (BartTokenizer): Tokenizer for the BART model
-    """
     patient_files = {}
     
     for file_name in os.listdir(notes_folder):
-        if not (file_name.endswith(".pdf") or file_name.endswith(".docx")):
+        if not (file_name.endswith(".pdf") or file_name.endswith(".docx") or file_name.endswith(".txt")):
             continue
         patient_id = file_name.split("_")[0]
         if patient_id not in patient_files:
@@ -90,6 +240,9 @@ def process_notes(notes_folder, output_folder, model, tokenizer):
                 combined_text += extract_text_from_pdf(file_path)
             elif file_name.endswith(".docx"):
                 combined_text += extract_text_from_word(file_path)
+            elif file_name.endswith(".txt"):
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    combined_text += clean_text(file.read())
 
         summary = generate_combined_summary(model, tokenizer, combined_text)
         output_file_path = os.path.join(output_folder, f"{patient_id}_summary.txt")
@@ -99,13 +252,6 @@ def process_notes(notes_folder, output_folder, model, tokenizer):
             output_file.write(f"{summary}\n")
 
 def main(notes_folder, output_folder):
-    """
-    Main function to load model and process clinical notes.
-
-    Args:
-        notes_folder (str): Path to folder containing clinical notes
-        output_folder (str): Path to save generated summaries
-    """
     model, tokenizer = load_model_and_tokenizer()
 
     if not os.path.exists(output_folder):
