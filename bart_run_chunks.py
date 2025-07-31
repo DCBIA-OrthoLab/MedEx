@@ -10,7 +10,7 @@ from transformers import BartTokenizer, BartForConditionalGeneration, Generation
 from utilities import initialize_key_value_summary, create_chunks_from_paragraphs
 
 def load_model_and_tokenizer():
-    model_name_or_path = "/home/lucia/Documents/Alban/MedEx/finetuned_models/fintetuned_bart_3500_prompt"
+    model_name_or_path = "/path/to/your/model"
     tokenizer = BartTokenizer.from_pretrained(model_name_or_path)
     model = BartForConditionalGeneration.from_pretrained(model_name_or_path)
     return model, tokenizer
